@@ -8,62 +8,262 @@
 
 | 项 | 内容 |
 |---|---|
-| 小组 | 第 <组号> 组 |
-| 仓库地址 | <https://github.com/…> |
-| 主机 | <云厂商与规格名，例如某云的 2 vCPU 4 GB 通用型> |
-| CPU | <`lscpu` 的 Model name；vCPU 数> |
-| 内存与 swap | <`free -m` 的 total；`swapon --show` 的输出，没有 swap 就写“无”> |
-| 操作系统、内核、systemd | <`/etc/os-release` 的 PRETTY_NAME；`uname -r`；`systemctl --version` 第一行> |
-| cgroup | <`stat -fc %T /sys/fs/cgroup` 的输出；`cat /sys/fs/cgroup/cgroup.controllers` 的输出> |
-| Go、Prometheus、node_exporter | <`go version`；`tools/prometheus --version` 第一行；`tools/node_exporter --version` 第一行> |
-| 分核 | 实例：<如 1>；loadgen、lbd、scaler、Prometheus、node_exporter：<如 0> |
+| 小组 | 第 7 组 |
+| 仓库地址 | <https://github.com/Daniel-647/ops-lab3-7> |
+| 主机 |  华为云，云主机（hostname `ecs-d83e`），4 vCPU / 7556 MB；QEMU/KVM 虚拟机，CPU Model name 为 `General Purpose Processor` |
+| CPU | 4 vCPU；`lscpu` 显示 Thread(s) per core 2、Core(s) per socket 2；`lscpu -e`：CPU 0、1 同属 CORE 0，CPU 2、3 同属 CORE 1 |
+| 内存与 swap | 7556 MB；无 swap（`swapon --show` 无输出） |
+| 操作系统、内核、systemd | Ubuntu 24.04.4 LTS；6.8.0-136-generic；systemd 255 (255.4-1ubuntu8.16)  |
+| cgroup | `stat -fc %T /sys/fs/cgroup` 输出 `cgroup2fs`；`cgroup.controllers` 为 `cpuset cpu io memory hugetlb pids rdma misc`  |
+| Go、Prometheus、node_exporter |  go1.26.9；prometheus 3.13.4；node_exporter 1.12.1  |
+| 分核 | 实例：2（`scaler -cpus 2`）；loadgen、lbd、scaler、Prometheus、node_exporter：0-1 |
 
 ## 2. 任务 A：配额，节流与 OOM
 
 ### 2.1 A1 配额算术
 
-预测（测量之前写）：配额 0.5 核、周期 100 ms 时，1 个和 2 个线程跑满，每个线程每个周期运行多久、被停多久？本机上 enrolld 的 GOMAXPROCS 会是几，为什么？<填写>
+预测（测量之前写）：配额 0.5 核、周期 100 ms 时，1 个和 2 个线程跑满，每个线程每个周期运行多久、被停多久？本机上 enrolld 的 GOMAXPROCS 会是几，为什么？
+
+1个线程时，每个线程每周期运行 50ms，被停 50ms
+2个线程时，每个线程每周期运行 25ms，被停 75ms
+GOMAXPROCS是 2，Go 1.25 起取“核数、绑核数、配额向上取整”三者的最小值，但不小于 2（主机只有 1 核时除外）。这台 4 核、配额 0.5 → 向上取整是 1 → 被抬到 2
+
 
 两次 `-burn` 的输出：
 
-```text
-<粘贴>
+```
+root@ecs-d83e:~/lab3# for n in 1 2; do
+  sudo systemd-run --quiet --scope -p CPUQuota=50% bin/enrolld -burn $n -for 10s
+done
+cgroup：/sys/fs/cgroup/system.slice/run-r178712b73c934562a789ad56aa5eddff.scope
+cpu.max：配额 0.50 核，周期 100ms（每个周期最多 50 ms CPU 时间）
+GOMAXPROCS=2，忙线程 1 个，计数 10.0 秒
+实际用核 0.50；周期 100 个，被节流 100 个（100%）；被停共 5.15 秒（按 CPU 累计）
+每个线程每个周期被停：实测 51.5 ms，算术 50.0 ms
+cgroup：/sys/fs/cgroup/system.slice/run-ra040fc8732a64eea9ca2a06905e4bea2.scope
+cpu.max：配额 0.50 核，周期 100ms（每个周期最多 50 ms CPU 时间）
+GOMAXPROCS=2，忙线程 2 个，计数 10.0 秒
+实际用核 0.50；周期 100 个，被节流 100 个（100%）；被停共 15.37 秒（按 CPU 累计）
+每个线程每个周期被停：实测 76.9 ms，算术 75.0 ms
+root@ecs-d83e:~/lab3# 
 ```
 
 | 线程数 | 周期数 | 被节流的周期 | 实际用核 | 每线程每周期被停（实测） | 算术 |
 |---|---|---|---|---|---|
-| 1 | <填写> | <填写> | <填写> | <填写> | <填写> |
-| 2 | <填写> | <填写> | <填写> | <填写> | <填写> |
+| 1 | 100 | 100 | 0.5 | 51.5ms | 50ms |
+| 2 | 100 | 100 | 0.5 | 76.9ms | 75ms |
 
 ### 2.2 A2 节流与 p99
 
 本组写的节流比例查询（与 `deploy/queries-red.txt` 一致）：
 
 ```text
-throttle_ratio      <填写>
+throttle_ratio      rate(cgroup_cpu_throttled_periods_total{job="enrolld"}[${window}]) / rate(cgroup_cpu_periods_total{job="enrolld"}[${window}])
 ```
 
-配额 100% 时测得的每请求 CPU：<填写> ms（`runs/<名字>/red.csv` 的 `cpu_ms_per_req`）；据此选定的到达率：<填写> 请求/秒，平均约 <填写> 核。
+配额 100% 时测得每请求 CPU **4.26 ms**（`runs/a2-base90/red.csv` 第 2 阶段的 `cpu_ms_per_req`）；据此选到达率 **90 请求/秒**，平均用量约 `90 × 0.00426 ≈ 0.38` 核，低于后面要设的 0.5 核配额。
 
-预测（配额改为 50% 之前写）：平均用量低于配额，p99 会不会变？节流比例大约多少？<填写>
+预测（配额改为 50% 之前写）：平均用量低于配额，p99 会不会变？节流比例大约多少？
+配额改为 50% 后，平均用量约 0.38 核，仍低于 0.5 核配额；但节流比例会大于 0（估计 0.1～0.3），客户端 p99 会从约 10 ms 明显上升，而 p50 基本不变。
 
 各次实验的数据（`scripts/table.sh runs/<名字> ok_rps p50_ms p99_ms server_p99_ms gomaxprocs cg_limit_cores cg_cpu_cores throttle_ratio throttled_s_per_s`，每次一张表）：
 
-<粘贴表格：100%、50%、改法一、改法二>
+100% 
+
+| step | ok_rps | p50_ms | p99_ms | server_p99_ms | gomaxprocs | cg_limit_cores | cg_cpu_cores | throttle_ratio | throttled_s_per_s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 92.3 | 6.97 | 10.25 | 9.96 | 2 | 1.0 | 0.400 | 0 | 0 |
+| 2 | 87.7 | 6.96 | 10.12 | 9.95 | 2 | 1.0 | 0.363 | 0 | 0 |
+
+50%
+
+| step | ok_rps | p50_ms | p99_ms | server_p99_ms | gomaxprocs | cg_limit_cores | cg_cpu_cores | throttle_ratio | throttled_s_per_s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 92.3 | 6.99 | 34.64 | 37.95 | 2 | 0.5 | 0.396 | 0.250 | 0.0614 |
+| 2 | 87.7 | 6.97 | 29.04 | 25.74 | 2 | 0.5 | 0.365 | 0.143 | 0.0254 |
+
+改法 1：70%
+
+| step | ok_rps | p50_ms | p99_ms | server_p99_ms | gomaxprocs | cg_limit_cores | cg_cpu_cores | throttle_ratio | throttled_s_per_s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 92.3 | 6.95 | 10.48 | 9.96 | 2 | 0.7 | 0.401 | 0.007 | 0.0008 |
+| 2 | 87.7 | 6.96 | 10.35 | 9.95 | 2 | 0.7 | 0.364 | 0 | 0 |
+
+改法 2：50% 配额 + GOMAXPROCS=1
+
+| step | ok_rps | p50_ms | p99_ms | server_p99_ms | gomaxprocs | cg_limit_cores | cg_cpu_cores | throttle_ratio | throttled_s_per_s |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 92.3 | 8.49 | 35.55 | 33.24 | 1 | 0.5 | 0.389 | 0.186 | 0.0254 |
+| 2 | 87.7 | 8.43 | 34.21 | 14.80 | 1 | 0.5 | 0.354 | 0.079 | 0.0088 |
+
+
+四组对照（同到达率 90）：
+
+| 方案 | 配额 | 线程 | throttle_ratio | p50 | p99 | 判断 |
+|---|---|---|---|---|---|---|
+| 基线 | 1.0 核 | 2 | 0 | 6.97 | 10.2 | 正常 |
+| 50% | 0.5 核 | 2 | 0.250 / 0.143 | 6.97 | 34.6 / 29.0 | 平均没超也节流 |
+| 改法一 | 0.7 核 | 2 | 0.007 / 0 | 6.95 | 10.5 / 10.4 | 有效 |
+| 改法二 | 0.5 核 | 1 | 0.186 / 0.079 | 8.49 | 35.6 / 34.2 | 无效，只是换队列 |
+
+结论：
+
+- 配额 50% 时 `cg_cpu_cores` 仍为 0.396 / 0.365，**平均用量低于配额**，但 `throttle_ratio` 达到 0.25 / 0.14，p99 从 10.2 ms 升到 34.6 / 29.0 ms，而 p50 与 `cpu_ms_per_req` 几乎不变——变差的是等待，不是计算。
+- 改法一（70%）把每周期额度从 50 ms 提到 70 ms，节流降到 0.007 / 0，p99 回到 10.5 ms；代价是预留配额从 0.5 核升到 0.7 核。
+- 改法二（GOMAXPROCS=1）虽然把节流比例降到 0.186 / 0.079，但 `sched_wait_p99_ms` 从约 4.6 ms 升到 10.9 / 9.6 ms，p99 仍为 35 ms 量级，p50 反而从 6.97 升到 8.49——**等待从 cgroup 节流转移到 Go 调度队列，尾延迟没有改善**。
+
 
 ### 2.3 A3 OOM
 
-预测（测量之前写）：`/api/report?mb=8&ms=500` 在到达率 10、20、30 时平均和最多各有几个在途请求？RSS 大约多少？在 `MemoryMax=200M` 下会在哪一个阶段被杀？<填写>
+预测（测量之前写）：`/api/report?mb=8&ms=500` 在到达率 10、20、30 时平均和最多各有几个在途请求？RSS 大约多少？在 `MemoryMax=200M` 下会在哪一个阶段被杀？
+
+每个请求占 8 MB、保持 500 ms。
+按 Little 定律，平均在途数 = 到达率 × 0.5 s：10 / 20 / 30 请求/秒对应 5 / 10 / 15 个在途。
+最多有：10 请求/秒 → 最多约 8 个  20 请求/秒 → 最多约 16 个  30 请求/秒 → 最多约 22 个
+
+平均 RSS ≈ 1.5 × 平均活数据 + 基线
+峰值 RSS ≈ (2 ×峰值活数据) + 基线13mb
+
+预测：10 请求/秒：平均约 73MB，峰值约 141MB   20 请求/秒：平均约 133 MB，峰值约 269 MB  30 请求/秒：平均约 193 MB，峰值约 365 MB
+
+在 MemoryMax=200M 下，预测第 1 阶段安全、第 2 阶段、第 3 阶段被 OOM kill。
+
 
 <粘贴三次实验的表格（`scripts/table.sh runs/<名字> ok_rps error_rate p99_ms inflight_avg report_inflight_max rss_max_mb heap_max_mb mem_current_max_mb mem_limit_mb`）>
 
+| step | target_rps | ok_rps | error_rate | p99_ms | inflight_avg | report_inflight_max | rss_max_mb | heap_max_mb | mem_current_max_mb | mem_limit_mb |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 10 | 9.1 | 0.0000 | 505.60 | 4.73333 | 8 | 138.539 | 113.446 | 133.555 | 200 |
+| 2 | 20 | 1.9 | 0.9066 | 505.28 | - | - | - | - | - | - |
+| all | - | 5.5 | 0.6211 | 505.45 | - | - | - | - | - | - |
+
+第 3 阶段（30 请求/秒）未运行：第 2 阶段成功率低于 50%，loadgen 按 `-stop-below` 停止。
+第 2 阶段服务端各列为 `-`：进程在该阶段开始约 2 秒后被杀，`run.sh` 查询的阶段末尾窗口内没有样本。
+
 被杀的证据（`systemctl show -p ActiveState,Result,ExecMainStatus lab3-a` 和 `journalctl -u lab3-a` 的相关行，`dmesg` 或 `/var/log/kern.log` 中的 oom-kill 行）：
 
+时间线：第 2 阶段 10:30:14 开始（`steps.csv` 的 `start_local`），10:30:16 被杀（`journalctl`）。
+客户端在第 2 阶段发出 396 个请求，成功 37 个，`net_err=359`（`runs/a3-oom/steps.csv`）。
+
 ```text
-<粘贴>
+$ systemctl show -p ActiveState,Result,ExecMainStatus lab3-a
+Result=oom-kill
+ExecMainStatus=9
+ActiveState=failed
+
+$ journalctl -u lab3-a --no-pager | tail -n 3
+Nov 25 10:30:16 ecs-d83e systemd[1]: lab3-a.service: A process of this unit has been killed by the OOM killer.
+Nov 25 10:30:16 ecs-d83e systemd[1]: lab3-a.service: Main process exited, code=killed, status=9/KILL
+Nov 25 10:30:16 ecs-d83e systemd[1]: lab3-a.service: Failed with result 'oom-kill'.
+
+$ sudo dmesg | grep -i oom-kill | tail -n 2
+[3455775.396693] enrolld invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0
+[3455775.396852] oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg=/system.slice/lab3-a.service,task_memcg=/system.slice/lab3-a.service,task=enrolld,pid=2733348,uid=0
 ```
 
-两种改法：按最坏情况定的 limit 是 <填写>（算式：<填写>）；限制并发时 `-report-max` 取 <填写>（依据：<填写>）。
+`constraint=CONSTRAINT_MEMCG` 且 `oom_memcg=/system.slice/lab3-a.service`，说明触发的是该实例 cgroup 的 200 MB 限额，不是整机内存不足；同一时段主机可用内存最低仍有 6427 MB（`runs/a3-oom/use.csv` 的 `mem_available_min_mb`）。
+
+`red.csv` 第 2 阶段无数据，另对 Prometheus 做了一次补充查询（不在 `runs/` 内），查询时刻 10:30:18，回看 10 秒：
+
+```text
+$ for m in cgroup_memory_current_bytes process_resident_memory_bytes go_heap_objects_bytes; do
+    echo -n "$m: "
+    curl -s 127.0.0.1:9090/api/v1/query \
+      --data-urlencode "query=max_over_time($m{job=\"enrolld\"}[10s]) / 1048576" \
+      --data-urlencode "time=1795573818" | grep -o '"value":\[[^]]*\]'
+  done
+cgroup_memory_current_bytes: "value":[1795573818,"181.81640625"]
+process_resident_memory_bytes: "value":[1795573818,"186.71875"]
+go_heap_objects_bytes: "value":[1795573818,"169.46697998046875"]
+```
+
+| 指标 | 第 1 阶段峰值 | 被杀前最后读数 | 限额 |
+|---|---|---|---|
+| cgroup 内存（MB） | 133.6 | 181.8 | 200 |
+| RSS（MB） | 138.5 | 186.7 | 200 |
+| Go 堆（MB） | 113.4 | 169.5 | - |
+
+三个读数都高于第 1 阶段的峰值，因此来自第 2 阶段开始后的那约 2 秒。cgroup 读数 181.8 MB 仍低于 200 MB，因为抓取间隔是 1 秒，内存在两次抓取之间越过限额，采样没有记录到越限的那一刻。
+
+
+两种改法：
+
+- 改法一：按最坏情况定 limit，最终取 400M。先按指导书口径（以到达率 20 为目标）试 300M，实测仍被杀，故放宽到 400M。
+- 改法二：limit 仍为 200M，`-report-max` 取 10。依据：由 `N × 8 MB × 2 + 13 MB ≤ 200 MB` 解得 `N ≤ 11.7`，取 10 使估算峰值 173 MB、实测 166 MB，留约 34 MB 余量。
+
+改法一：先按指导书口径以到达率 20 为目标计算，`2 × 16 × 8 MB + 13 MB = 269 MB`，加约 10% 余量约 296 MB，取 300M，实测 `runs/a3-limit300`：
+
+| step | target_rps | ok_rps | error_rate | inflight_avg | report_inflight_max | rss_max_mb | heap_max_mb | mem_current_max_mb | mem_limit_mb |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 10 | 9.1 | 0 | 4.13333 | 6 | 135.031 | 97.3906 | 130.023 | 300 |
+| 2 | 20 | 6.1 | 0.6919 | 9 | 12 | 278.145 | 209.546 | 273.441 | 300 |
+| 3 | 30 | 0.0 | 1.0000 | - | - | - | - | - | - |
+
+300M 下 20 档仍然被杀：396 个请求只成功 122 个，约 6 秒后进程消失（结束时 `curl: Failed to connect to 127.0.0.1:8081`）。该档 `report_inflight_max` 只有 12，说明它连峰值都没到就被杀，真实需求高于采样到的 273 MB。
+
+因此取 400M，算式：按 30 请求/秒的峰值在途 21～22 个估算，`2 × 21 × 8 MB + 13 MB ≈ 349 MB`，加约 15% 余量取 400M，实测 `runs/a3-limit400`：
+
+| step | target_rps | ok_rps | error_rate | inflight_avg | report_inflight_max | rss_max_mb | heap_max_mb | mem_current_max_mb | mem_limit_mb |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 10 | 8.4 | 0 | 4.73333 | 9 | 138.391 | 121.421 | 133.379 | 400 |
+| 2 | 20 | 20.0 | 0 | 10.8667 | 16 | 298.75 | 201.546 | 294.078 | 400 |
+| 3 | 30 | 31.3 | 0 | 15.3333 | 21 | 330.602 | 281.683 | 326.41 | 400 |
+
+三档全部跑完，`server_error_rate` 全为 0，进程未再被 OOM kill。
+
+与预测的对照：峰值在途 9 / 16 / 21，与预测的 8 / 16 / 22 基本一致；
+峰值 RSS 138.4 / 298.8 / 330.6，与预测的 141 / 269 / 365 相比，误差分别为 1.8% / 11.0% / 9.4%。
+20 档低估 11%，因为预测把“堆外开销”固定取 13 MB，而实测 rss 与 heap 的差值随负载升高
+（17.0 / 97.3 / 48.9 MB），原因是 GC 回收后的空闲页未立即归还操作系统，且两个
+`max_over_time` 各自取峰值、不保证同一时刻。
+
+三次限额的递进对照（同一负载 `-rates 10,20,30`，只改 `MemoryMax`）：
+
+| MemoryMax | 20 档成功 | 20 档失败率 | 20 档存活时间 | 20 档峰值 cgroup 内存 |
+|---|---|---|---|---|
+| 200M | 37 / 396 | 90.7% | 约 2 秒 | 181.8（死前读数） |
+| 300M | 122 / 396 | 69.2% | 约 6 秒 | 273.4（死前读数） |
+| 400M | 396 / 396 | 0% | 全程 20 秒 | 294.1 |
+
+这组数据解释了原来的 OOM：20 请求/秒的真实内存需求约 294 MB、30 请求/秒约 326 MB，均超过 200 MB 限额。
+同时也说明“估算值加 10% 余量”并不安全：`2 × 16 × 8 + 13 = 269 MB` 对 20 档低估约 8.5%（实测 294 MB），
+10% 余量几乎被误差吃光；估算公式本身的误差约 ±10%（10 档低估 18%、30 档高估 7%），因此余量应取 15%～20%，而不是 10%。
+
+改法二：`MemoryMax` 保持 200M，加 `-report-max 10`，其余不变，`runs/a3-reportmax`。
+
+| step | target_rps | ok_rps | error_rate | inflight_avg | report_inflight_max | rss_max_mb | heap_max_mb | mem_current_max_mb | mem_limit_mb |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 10 | 9.1 | 0 | 4.2 | 9 | 138.348 | 113.398 | 133.316 | 200 |
+| 2 | 20 | 15.4 | 0.2222 | 7.4 | 10 | 170.586 | 153.439 | 165.547 | 200 |
+| 3 | 30 | 17.9 | 0.4270 | 8.66667 | 10 | 170.723 | 145.462 | 165.953 | 200 |
+
+`report_inflight_max` 在 20、30 两档均为 10，与 `-report-max 10` 一致；内存封在约 166 MB，
+低于 200 MB 限额 34 MB，三档均未被 OOM kill。跑满 60 秒后 loadgen 正常结束，
+未出现 `a3-oom` 中的 `curl: Failed to connect to 127.0.0.1:8081`，说明进程一直在服务。
+
+预测“内存约 173 MB”与实测 166 MB 相差 4%。但预测的拒绝率偏悲观：由 `10 ÷ 0.5 s = 20 请求/秒`
+可知该配置的服务能力正好是 20 请求/秒，20 档的平均需求与能力相等，而实测拒绝率 22.2%，
+来自泊松到达的瞬时峰值（同一时刻到达超过 10 个即被拒）；30 档理论拒绝率 `(30 − 20) ÷ 30 = 33.3%`，
+实测 42.7%，同样是波动放大。
+
+`server_mean_ms` 从 501 降至 383、287 并非服务变快：被拒请求立即返回 503、不占用 500 ms，
+计入直方图后拉低了均值。
+
+三种方案的对照：
+
+| 方案 | MemoryMax | report-max | 峰值并发 | 峰值 cgroup 内存 | 20 档 | 30 档 |
+|---|---|---|---|---|---|---|
+| 原方案 | 200M | 不限 | 9（死前） | 181.8（死前读数） | 90.7% 失败，约 2 秒后 OOM | 未运行 |
+| 改法一 | 400M | 不限 | 21 | 326.4 | 全部成功 | 全部成功 |
+| 改法二 | 200M | 10 | 10 | 166.0 | 22.2% 被拒，进程存活 | 42.7% 被拒，进程存活 |
+
+两种改法的取舍：
+
+- 改法一按最坏情况给内存（`2 × 21 × 8 + 13 ≈ 349 MB`，取 400M），请求全部得到服务，代价是为峰值预留约 2 倍于日常需求的内存，空闲时这 400 MB 也不能被他用；且高峰之后再涨仍需重新调大，是“墙往后退”的思路。
+- 改法二不改限额，把并发封顶（`N × 8 × 2 + 13 ≤ 200` → 取 10），内存由配置决定、不随负载变化（20 档与 30 档分别为 165.5 与 166.0 MB），代价是超出能力的请求直接被拒（30 档 42.7% 返回 503），即用可用性换稳定性。
+- 选择依据：若请求必须全部成功、且内存可随峰值增长，选改法一；若内存是硬约束、调用方支持快速失败与重试，选改法二。更稳妥的是两者并用——按业务上限给一个足够的限额，再用 `-report-max` 兜底，避免单一参数失效时直接 OOM。
+
+
 
 ## 3. 任务 B：伸缩控制环
 
@@ -151,7 +351,21 @@ C3 中健康检查为什么全部通过？用 `runs/<名字>/lbd-metrics-end.txt
 
 **问题 1：配额。** A1 实测的每线程每周期被停时间与 L-09 第 12 页的算术相差多少，差异来自何处？A2 中平均用量低于配额时，p99 为什么变大？两种改法各改变了什么，各有什么代价？A3 中 RSS 的推算与实测是否一致？Go 的垃圾回收对“基线 + 在途数 × 每请求内存”这个估计有什么影响？`MemoryMax` 为什么要和 `MemorySwapMax=0` 一起设？按最坏情况定 limit 与限制并发，各适合什么条件？
 
-<填写>
+数据：2.1 的两次 `-burn` 输出；`runs/a2-base90`、`a2-q50`、`a2-q70`、`a2-gmp1`；`runs/a3-oom`、`a3-limit300`、`a3-limit400`、`a3-reportmax`。
+
+**A1 实测与算术差多少，差在哪？** 实测 51.5 / 76.9 ms，算术 50 / 75 ms，多 1.5～1.9 ms。来自线程放行到获得 CPU 的调度延迟、周期边界未用完的零头、`cpu.stat` 的计时精度；两线程偏差更大，因要争同一份额度。
+
+**平均用量低于配额，p99 为什么变大？** 配额按 100 ms 周期结算。90 请求/秒、每请求 4.26 ms，一个周期平均来 9 个请求，泊松波动使部分周期超过 12 个（`50 ÷ 4.26 ≈ 11.7`），额度耗尽后整个 cgroup 冻结到下一周期。实测 `throttle_ratio` 0.25 / 0.14，p99 由 10.2 升至 34.6 / 29.0 ms，而 p50 仍为 6.97 ms——变差的是等待，命中的是尾部请求。
+
+**两种改法各改变了什么，代价是什么？** 70% 配额把每周期额度由 50 ms 提到 70 ms，节流降至 0.007 / 0，p99 回到 10.5 ms，代价是多预留 0.2 核。`GOMAXPROCS=1` 把并行消耗改为串行，节流降至 0.19 / 0.08，但 `sched_wait_p99` 由 4.6 升至 10.9 / 9.6 ms，p99 仍 35 ms——等待只是从 cgroup 冻结搬到 Go 调度队列。
+
+**A3 的 RSS 推算与实测一致吗？** 预测 141 / 269 / 365 MB，实测 138.4 / 298.8 / 330.6 MB，误差 1.8% / 11.0% / 9.4%，量级一致；20 档低估 8.5%，因为把堆外开销固定取成 13 MB。
+
+**GC 对这个估计有什么影响？** GOGC=100 时堆在“存活量 → 2 × 存活量”之间震荡，峰值在触发回收前，所以“基线 + 在途数 × 每请求内存”只是存活数据，当峰值须再乘约 2（实测堆/活数据 = 1.77）。基线并非常数，由空载 13 MB 涨到负载下 17～97 MB。300M 实验表明两者误差叠加后 10% 余量不够，20 档仍被杀，400M 才跑通。
+
+**为什么要配 `MemorySwapMax=0`？** `MemoryMax` 只管内存不管 swap；有 swap 时超出的页被换出，进程变慢而不会被杀，OOM 复现不出来。本机无 swap，换到有 swap 的机器必须显式设。
+
+**两种定 limit 各适合什么条件？** 按最坏情况定 limit 适合请求不能失败、内存可随峰值增长（报表接口），代价是为峰值预留约 2 倍日常内存、高峰再涨需重调；限制并发适合内存是硬约束、调用方可重试，内存可预测（165.5 / 166.0 MB 两档不变），代价是拒绝（30 档 42.7% 为 503）。两者并用最稳：限额防突发，`-report-max` 兜底。
 
 **问题 2：控制环。** 各段延迟的实测值是多少，哪一段最长，能压缩多少？三种方案的缺口与实例·分钟各是多少？两种信号的差别在哪里，为什么？B2 的缺口中除了超时，还有 lbd 返回的 503：过载为什么会让健康检查也失败，这使缺口变得更严重还是更轻？你们会为“开放日”选哪个方案，结论在什么条件下成立？（可选：思考题 3 第四幕中你们的判断，与这里测到的现象是否一致？）
 
